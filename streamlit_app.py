@@ -377,15 +377,15 @@ with col_input:
 with col_send:
     send = st.button("Send →", use_container_width=True, disabled=not is_ready)
 
-if (send or user_input) and user_input.strip() and is_ready:
+if send and user_input.strip() and is_ready:
     question = user_input.strip()
     st.session_state.messages.append({"role": "user", "content": question})
 
     chain = build_chain(st.session_state.vectorstore, model_name, mistral_key, temperature, top_k)
 
     with st.spinner("Searching documents and generating answer..."):
-        t0      = time.time()
-        result  = chain.invoke({"question": question})
+        t0     = time.time()
+        result = chain.invoke({"question": question})
         elapsed = time.time() - t0
 
     answer       = result["result"].strip()
@@ -396,8 +396,5 @@ if (send or user_input) and user_input.strip() and is_ready:
         "sources": sources_html, "time": f"{elapsed:.1f}s",
     })
     st.rerun()
-
-elif (send or user_input) and not mistral_key:
-    st.warning("⚠️ Please enter your Mistral AI API key in the sidebar.")
 elif (send or user_input) and not st.session_state.vectorstore:
     st.warning("⚠️ Please upload documents and click **Build Index** first.")
