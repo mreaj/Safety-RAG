@@ -1,28 +1,29 @@
-# RAG core
-langchain==0.2.16
-langchain-community==0.2.16
-langchain-core==0.2.38
-langchain-mistralai==0.1.8
+# ── LangChain 1.x stack (Python 3.14 compatible) ─────────────────────────────
+langchain>=1.0.0
+langchain-community>=0.3.20
+langchain-core>=1.0.0
+langchain-mistralai>=1.1.1
+langchain-text-splitters>=0.3.0
 
-# Mistral AI API
-mistralai==0.4.2
+# ── Mistral AI API (v1+, no orjson dependency) ────────────────────────────────
+mistralai>=1.0.0
 
-# Embeddings — no pinned torch, let pip resolve for Python 3.14
+# ── Embeddings ────────────────────────────────────────────────────────────────
 sentence-transformers>=3.0.1
 torch>=2.9.0
 transformers>=4.44.0
 
-# Vector store
-chromadb>=0.5.5
+# ── Vector store (1.5.2+ fixes Python 3.14 pydantic v1 issue) ────────────────
+chromadb>=1.5.2
 
-# Document loaders
+# ── Document loaders ──────────────────────────────────────────────────────────
 pypdf>=4.3.1
 docx2txt>=0.8
 python-docx>=1.1.2
 
-# UI
+# ── UI ────────────────────────────────────────────────────────────────────────
 streamlit>=1.36.0
 
-# Utilities
+# ── Utilities ─────────────────────────────────────────────────────────────────
 pydantic>=2.8.2
 requests>=2.32.3
