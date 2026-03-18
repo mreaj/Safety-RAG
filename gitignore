@@ -1,0 +1,14 @@
+# Secrets — NEVER commit these
+.streamlit/secrets.toml
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Local vector store (not needed on cloud)
+chroma_db/
+documents/
