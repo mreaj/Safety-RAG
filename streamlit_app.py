@@ -110,11 +110,11 @@ def format_sources(source_docs: list) -> str:
 
 @st.cache_resource(show_spinner=False)
 def build_vectorstore_from_bytes(_file_tuples: tuple):
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
     from langchain_community.vectorstores import Chroma
     from langchain_community.embeddings import HuggingFaceEmbeddings
     from langchain_community.document_loaders import PyPDFLoader
-    from langchain.schema import Document
+    from langchain_core.documents import Document
     import tempfile, docx2txt
 
     all_docs = []
@@ -159,13 +159,14 @@ def build_vectorstore_from_bytes(_file_tuples: tuple):
 
 
 def build_chain(vectorstore, model_name: str, api_key: str, temperature: float, top_k: int):
-    from langchain.chains import RetrievalQA
-    from langchain.prompts import PromptTemplate
+    from langchain_core.prompts import PromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.runnables import RunnablePassthrough
     from langchain_mistralai import ChatMistralAI
 
     llm = ChatMistralAI(
         model=model_name,
-        mistral_api_key=api_key,
+        api_key=api_key,
         temperature=temperature,
         max_tokens=1024,
     )
@@ -190,11 +191,20 @@ Answer:""",
         search_kwargs={"k": top_k, "fetch_k": top_k * 4, "lambda_mult": 0.7},
     )
 
-    return RetrievalQA.from_chain_type(
-        llm=llm, chain_type="stuff", retriever=retriever,
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": prompt},
+    def format_docs(docs):
+        return "".join(doc.page_content for doc in docs)
+
+    # LCEL chain — modern LangChain 1.x style, no deprecated RetrievalQA
+    chain = (
+        RunnablePassthrough.assign(
+            context=lambda x: format_docs(retriever.invoke(x["question"])),
+            source_documents=lambda x: retriever.invoke(x["question"]),
+        )
+        | RunnablePassthrough.assign(
+            result=(prompt | llm | StrOutputParser())
+        )
     )
+    return chain
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -375,7 +385,7 @@ if (send or user_input) and user_input.strip() and is_ready:
 
     with st.spinner("Searching documents and generating answer..."):
         t0      = time.time()
-        result  = chain({"query": question})
+        result  = chain.invoke({"question": question})
         elapsed = time.time() - t0
 
     answer       = result["result"].strip()
