@@ -1,0 +1,28 @@
+# RAG core
+langchain==0.2.16
+langchain-community==0.2.16
+langchain-core==0.2.38
+langchain-mistralai==0.1.8
+
+# Mistral AI API
+mistralai==0.4.2
+
+# Embeddings (CPU — works on Streamlit Cloud free tier)
+sentence-transformers==3.0.1
+torch==2.3.1+cpu
+transformers==4.44.0
+
+# Vector store — in-memory
+chromadb==0.5.5
+
+# Document loaders
+pypdf==4.3.1
+docx2txt==0.8
+python-docx==1.1.2
+
+# UI
+streamlit==1.36.0
+
+# Utilities
+pydantic==2.8.2
+requests==2.32.3
