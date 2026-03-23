@@ -109,7 +109,12 @@ def format_sources(source_docs: list) -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def build_vectorstore_from_bytes(_file_tuples: tuple):
+def build_vectorstore_from_bytes(_file_tuples: tuple, cache_version: int):
+    """
+    cache_version is a plain (non-underscored) int so Streamlit DOES include
+    it in the cache key — incrementing it forces a full rebuild even when the
+    same file bytes are re-uploaded.
+    """
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     from langchain_community.vectorstores import Chroma
     from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -213,6 +218,7 @@ for key, default in [
     ("vectorstore", None),
     ("chunk_count", 0),
     ("indexed_files", []),
+    ("index_version", 0),   # bumped on every "Build Index" click to bust cache
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -281,8 +287,13 @@ with st.sidebar:
     if uploaded_files:
         if st.button("⚙️ Build Index from Uploads", use_container_width=True):
             with st.spinner(f"Processing {len(uploaded_files)} file(s)..."):
+                # Increment version FIRST to bust the @st.cache_resource cache,
+                # guaranteeing a fresh build even if the same files are re-uploaded.
+                st.session_state.index_version += 1
                 file_tuples = tuple((f.name, f.read()) for f in uploaded_files)
-                vs, count   = build_vectorstore_from_bytes(file_tuples)
+                vs, count   = build_vectorstore_from_bytes(
+                    file_tuples, st.session_state.index_version
+                )
                 if vs:
                     st.session_state.vectorstore   = vs
                     st.session_state.chunk_count   = count
@@ -307,8 +318,12 @@ with st.sidebar:
             for fname in st.session_state.indexed_files:
                 st.markdown(f'<span class="source-tag">{fname}</span>', unsafe_allow_html=True)
 
-    if st.button("🗑️ Clear Chat", use_container_width=True):
-        st.session_state.messages = []
+    # ── Clear Chat — also resets the index so there's no stale vectorstore ──
+    if st.button("🗑️ Clear Chat & Index", use_container_width=True):
+        st.session_state.messages      = []
+        st.session_state.vectorstore   = None
+        st.session_state.indexed_files = []
+        st.session_state.chunk_count   = 0
         st.rerun()
 
 
@@ -384,8 +399,8 @@ if send and user_input.strip() and is_ready:
     chain = build_chain(st.session_state.vectorstore, model_name, mistral_key, temperature, top_k)
 
     with st.spinner("Searching documents and generating answer..."):
-        t0     = time.time()
-        result = chain.invoke({"question": question})
+        t0      = time.time()
+        result  = chain.invoke({"question": question})
         elapsed = time.time() - t0
 
     answer       = result["result"].strip()
