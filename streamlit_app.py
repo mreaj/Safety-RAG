@@ -2,20 +2,16 @@
 Safety Standards RAG Chatbot — Streamlit Community Cloud Edition
 Stack: Mistral AI API · LangChain · ChromaDB (in-memory) · Streamlit
 
-Enhancements over v1:
-  ✅ Multi-doc synthesis  — labeled chunks, per-file coverage guarantee
-  ✅ Conversation memory  — last N turns injected into every prompt
-  ✅ Confidence indicator — colour-coded High / Medium / Low badge
-  ✅ Response timing      — shown under every bot bubble
-  ✅ Chat export          — download full conversation as .txt
-  ✅ Document scope       — ask against ALL docs or one specific file
-  ✅ Suggested follow-ups — 3 clickable chips after every answer
-  ✅ Chunk preview        — expandable raw-chunk viewer per answer
-  ✅ Answer style toggle  — Concise / Detailed / Bullet-points
-  ✅ Cache-bust fix       — index_version guarantees fresh rebuild
+Document parsing:
+  • pdfplumber   — text + structured tables (preserves rows/cols as markdown)
+  • pytesseract  — OCR for scanned / image-only PDF pages
+  • pdf2image    — rasterises PDF pages for OCR
+  • python-docx  — DOCX text + proper table cell extraction
+  • docx2txt     — fallback for legacy .doc files
+
 """
 
-import os, time, logging, io
+import os, time, logging, io, re
 from pathlib import Path
 
 import streamlit as st
@@ -43,7 +39,7 @@ ANSWER_MODES = {
     "Detailed":      "Give a thorough, detailed answer covering all relevant aspects.",
     "Bullet Points": "Structure your entire answer as clear bullet points.",
 }
-MEMORY_TURNS = 4  # how many past Q/A pairs to include as memory
+MEMORY_TURNS = 4
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -78,11 +74,13 @@ html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;colo
 .conf-high{font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(34,197,94,.12);color:var(--success);border:1px solid rgba(34,197,94,.25);}
 .conf-med{font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(245,158,11,.12);color:var(--warn);border:1px solid rgba(245,158,11,.25);}
 .conf-low{font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(239,68,68,.12);color:var(--danger);border:1px solid rgba(239,68,68,.25);}
+.parse-badge{font-size:10px;padding:1px 6px;border-radius:8px;background:rgba(240,165,0,.08);border:1px solid rgba(240,165,0,.2);color:#c9a84c;margin:1px;font-family:'JetBrains Mono',monospace;}
 .sources-block{margin-top:10px;padding:9px 13px;background:var(--surface2);border-left:3px solid var(--accent);border-radius:0 7px 7px 0;font-size:12px;color:var(--muted);}
 .sources-block strong{color:var(--accent);}
 .source-tag{display:inline-block;background:rgba(240,165,0,.08);border:1px solid rgba(240,165,0,.2);border-radius:4px;padding:2px 7px;margin:2px 2px 0 0;font-family:'JetBrains Mono',monospace;font-size:11px;color:#c9a84c;}
-.chunk-box{background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:10px 13px;font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--muted);white-space:pre-wrap;max-height:160px;overflow-y:auto;margin-bottom:8px;}
+.chunk-box{background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:10px 13px;font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--muted);white-space:pre-wrap;max-height:180px;overflow-y:auto;margin-bottom:8px;}
 .chunk-label{font-size:11px;font-weight:600;color:var(--accent);margin-bottom:4px;}
+.parse-info{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:11.5px;color:var(--muted);margin-top:6px;}
 .stTextInput>div>div>input{background:var(--surface)!important;border:1px solid var(--border)!important;border-radius:11px!important;color:var(--text)!important;font-family:'DM Sans',sans-serif!important;font-size:14px!important;padding:13px 17px!important;transition:border-color .2s!important;}
 .stTextInput>div>div>input:focus{border-color:var(--accent)!important;box-shadow:0 0 0 3px rgba(240,165,0,.1)!important;}
 .stTextInput>div>div>input::placeholder{color:var(--muted)!important;}
@@ -97,7 +95,7 @@ html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;colo
 [data-testid="stExpander"]{background:var(--surface2)!important;border:1px solid var(--border)!important;border-radius:9px!important;}
 [data-testid="stExpander"] summary{color:var(--muted)!important;font-size:12px!important;}
 [data-testid="stFileUploader"]{background:var(--surface2)!important;border:1px dashed rgba(240,165,0,.3)!important;border-radius:11px!important;}
-.welcome-card{border:1px solid var(--border);border-radius:15px;padding:28px;text-align:center;background:var(--surface);margin:32px auto;max-width:520px;}
+.welcome-card{border:1px solid var(--border);border-radius:15px;padding:28px;text-align:center;background:var(--surface);margin:32px auto;max-width:540px;}
 .welcome-icon{font-size:44px;margin-bottom:14px;}
 .welcome-title{font-family:'DM Serif Display',serif;font-size:21px;color:var(--text);margin-bottom:8px;}
 .welcome-text{font-size:13.5px;color:var(--muted);line-height:1.6;}
@@ -113,7 +111,228 @@ hr{border-color:var(--border)!important;}
 """, unsafe_allow_html=True)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DOCUMENT PARSERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _table_to_markdown(table: list) -> str:
+    """Convert a pdfplumber table (list of rows) to a markdown grid."""
+    if not table:
+        return ""
+    rows = []
+    for i, row in enumerate(table):
+        cells = [str(c).strip() if c else "" for c in row]
+        rows.append("| " + " | ".join(cells) + " |")
+        if i == 0:
+            rows.append("|" + "|".join(["---"] * len(cells)) + "|")
+    return "\n".join(rows)
+
+
+def _docx_table_to_markdown(table) -> str:
+    """Convert a python-docx Table object to a markdown grid."""
+    rows = []
+    for i, row in enumerate(table.rows):
+        cells = [cell.text.strip() for cell in row.cells]
+        rows.append("| " + " | ".join(cells) + " |")
+        if i == 0:
+            rows.append("|" + "|".join(["---"] * len(cells)) + "|")
+    return "\n".join(rows)
+
+
+def _ocr_page(pil_image) -> str:
+    """Run Tesseract OCR on a PIL image; return extracted text."""
+    try:
+        import pytesseract
+        return pytesseract.image_to_string(pil_image, config="--psm 6")
+    except Exception as e:
+        logger.warning(f"OCR failed: {e}")
+        return ""
+
+
+def parse_pdf(filename: str, file_bytes: bytes) -> tuple[list, dict]:
+    """
+    Parse a PDF with pdfplumber.
+    - Extracts regular text per page
+    - Extracts tables as markdown grids
+    - Falls back to OCR (Tesseract) for pages with no extractable text
+
+    Returns (documents, parse_stats)
+    """
+    import pdfplumber
+    from pdf2image import convert_from_bytes
+    from langchain_core.documents import Document
+
+    docs       = []
+    stats      = {"pages": 0, "tables": 0, "ocr_pages": 0, "text_pages": 0}
+    ocr_needed = []  # page indices that returned no text
+
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        stats["pages"] = len(pdf.pages)
+
+        for page_num, page in enumerate(pdf.pages):
+            parts = []
+
+            # ── Regular text ──────────────────────────────────────────────────
+            raw_text = page.extract_text() or ""
+
+            # ── Tables — extract BEFORE text so we can remove their bbox ──────
+            tables = page.extract_tables()
+            table_md_blocks = []
+            for tbl in tables:
+                md = _table_to_markdown(tbl)
+                if md:
+                    table_md_blocks.append(md)
+                    stats["tables"] += 1
+
+            if raw_text.strip():
+                parts.append(raw_text.strip())
+                stats["text_pages"] += 1
+            else:
+                ocr_needed.append(page_num)
+
+            for md in table_md_blocks:
+                parts.append(f"\n[TABLE]\n{md}\n[/TABLE]\n")
+
+            if parts:
+                content = "\n\n".join(parts)
+                docs.append(Document(
+                    page_content=content,
+                    metadata={"source_file": filename, "page": page_num},
+                ))
+
+    # ── OCR pass for image-only pages ────────────────────────────────────────
+    if ocr_needed:
+        try:
+            all_images = convert_from_bytes(file_bytes, dpi=200)
+            for page_num in ocr_needed:
+                if page_num < len(all_images):
+                    ocr_text = _ocr_page(all_images[page_num])
+                    if ocr_text.strip():
+                        docs.append(Document(
+                            page_content=f"[OCR]\n{ocr_text.strip()}\n[/OCR]",
+                            metadata={"source_file": filename, "page": page_num, "ocr": True},
+                        ))
+                        stats["ocr_pages"] += 1
+        except Exception as e:
+            logger.warning(f"OCR pass failed for {filename}: {e}")
+
+    # Sort by page number
+    docs.sort(key=lambda d: d.metadata.get("page", 0))
+    return docs, stats
+
+
+def parse_docx(filename: str, file_bytes: bytes) -> tuple[list, dict]:
+    """
+    Parse a DOCX with python-docx.
+    - Extracts paragraphs as text
+    - Extracts tables as markdown grids (cell-by-cell, structure preserved)
+
+    Returns (documents, parse_stats)
+    """
+    import docx as _docx
+    from langchain_core.documents import Document
+
+    doc   = _docx.Document(io.BytesIO(file_bytes))
+    stats = {"tables": 0, "paragraphs": 0}
+    parts = []
+
+    for block in doc.element.body:
+        tag = block.tag.split("}")[-1] if "}" in block.tag else block.tag
+
+        if tag == "p":
+            # Paragraph
+            para = _docx.text.paragraph.Paragraph(block, doc)
+            text = para.text.strip()
+            if text:
+                parts.append(text)
+                stats["paragraphs"] += 1
+
+        elif tag == "tbl":
+            # Table — convert to markdown
+            table = _docx.table.Table(block, doc)
+            md    = _docx_table_to_markdown(table)
+            if md:
+                parts.append(f"\n[TABLE]\n{md}\n[/TABLE]\n")
+                stats["tables"] += 1
+
+    content = "\n\n".join(parts)
+    documents = [Document(page_content=content, metadata={"source_file": filename})] if content.strip() else []
+    return documents, stats
+
+
+def parse_txt(filename: str, file_bytes: bytes) -> tuple[list, dict]:
+    from langchain_core.documents import Document
+    text = file_bytes.decode("utf-8", errors="ignore")
+    return [Document(page_content=text, metadata={"source_file": filename})], {}
+
+
+def parse_doc_legacy(filename: str, file_bytes: bytes) -> tuple[list, dict]:
+    """Fallback for legacy .doc using docx2txt (no table support)."""
+    import docx2txt
+    from langchain_core.documents import Document
+    text = docx2txt.process(io.BytesIO(file_bytes))
+    return [Document(page_content=text, metadata={"source_file": filename})], {"note": "legacy .doc — tables not extracted"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  VECTORSTORE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_resource(show_spinner=False)
+def build_vectorstore_from_bytes(_file_tuples: tuple, cache_version: int):
+    """
+    cache_version (no leading underscore) is included in Streamlit's cache key —
+    incrementing it forces a full rebuild even for identical file bytes.
+    """
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_community.vectorstores import Chroma
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+
+    all_docs    = []
+    all_stats   = {}
+
+    for filename, file_bytes in _file_tuples:
+        ext = Path(filename).suffix.lower()
+        try:
+            if ext == ".pdf":
+                docs, stats = parse_pdf(filename, file_bytes)
+            elif ext == ".docx":
+                docs, stats = parse_docx(filename, file_bytes)
+            elif ext == ".doc":
+                docs, stats = parse_doc_legacy(filename, file_bytes)
+            elif ext == ".txt":
+                docs, stats = parse_txt(filename, file_bytes)
+            else:
+                logger.warning(f"Unsupported file type: {filename}")
+                continue
+            all_docs.extend(docs)
+            all_stats[filename] = stats
+            logger.info(f"Parsed {filename}: {len(docs)} docs, stats={stats}")
+        except Exception as e:
+            logger.warning(f"Skipped {filename}: {e}")
+            all_stats[filename] = {"error": str(e)}
+
+    if not all_docs:
+        return None, 0, {}
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000, chunk_overlap=200,
+        separators=["\n\n", "\n", ". ", "! ", "? "],
+    )
+    chunks = splitter.split_documents(all_docs)
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBED_MODEL,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+    vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings)
+    return vectorstore, len(chunks), all_stats
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RAG HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def get_mistral_key() -> str:
     try:
@@ -127,7 +346,8 @@ def format_sources(source_docs: list) -> str:
     for doc in source_docs:
         name  = doc.metadata.get("source_file", doc.metadata.get("source", "Unknown"))
         page  = doc.metadata.get("page", "")
-        label = name + (f" · p{page+1}" if page != "" else "")
+        ocr   = " 🔍OCR" if doc.metadata.get("ocr") else ""
+        label = name + (f" · p{page+1}" if page != "" else "") + ocr
         if label not in seen:
             seen.add(label)
             tags.append(f'<span class="source-tag">📄 {label}</span>')
@@ -135,12 +355,12 @@ def format_sources(source_docs: list) -> str:
 
 
 def format_docs_labeled(docs: list) -> str:
-    """Render chunks with [Source: …] headers so LLM can cite per-document."""
     parts = []
     for doc in docs:
         source = doc.metadata.get("source_file", "Unknown")
         page   = doc.metadata.get("page", "")
-        label  = source + (f" (page {page+1})" if page != "" else "")
+        ocr    = " [OCR]" if doc.metadata.get("ocr") else ""
+        label  = source + (f" page {page+1}" if page != "" else "") + ocr
         parts.append(f"[Source: {label}]\n{doc.page_content.strip()}")
     return "\n\n---\n\n".join(parts)
 
@@ -162,36 +382,30 @@ def estimate_confidence(answer: str, source_docs: list) -> str:
 def confidence_badge(level: str) -> str:
     labels = {"high": "● High confidence", "medium": "◐ Medium confidence", "low": "○ Low confidence"}
     css    = {"high": "conf-high", "medium": "conf-med", "low": "conf-low"}
-    return f'<span class="{css.get(level,"conf-med")}">{labels.get(level,"")}</span>'
+    return f'<span class="{css.get(level, "conf-med")}">{labels.get(level, "")}</span>'
 
 
 def get_cross_doc_context(vectorstore, question: str, indexed_files: list, top_k: int) -> list:
-    """
-    MMR retrieval + guarantee at least 1 chunk from every indexed file
-    so no document is silently dropped.
-    """
     retriever = vectorstore.as_retriever(
         search_type="mmr",
         search_kwargs={"k": top_k, "fetch_k": top_k * 4, "lambda_mult": 0.65},
     )
     docs = retriever.invoke(question)
-    retrieved_sources = {d.metadata.get("source_file", "") for d in docs}
-
+    retrieved = {d.metadata.get("source_file", "") for d in docs}
     for source in indexed_files:
-        if source not in retrieved_sources:
+        if source not in retrieved:
             try:
                 extras = vectorstore.similarity_search(
                     question, k=2, filter={"source_file": source}
                 )
                 docs.extend(extras)
-                retrieved_sources.add(source)
+                retrieved.add(source)
             except Exception:
-                pass  # Chroma filter may not be supported — silently skip
+                pass
     return docs
 
 
 def build_memory_text(messages: list) -> str:
-    """Render the last MEMORY_TURNS Q/A pairs as plain text for the prompt."""
     qa_pairs = [
         (messages[i], messages[i + 1])
         for i in range(len(messages) - 1)
@@ -220,10 +434,9 @@ def export_chat(messages: list) -> str:
 
 
 def generate_follow_ups(answer: str, question: str, api_key: str, model: str) -> list:
-    """Ask Mistral for 3 follow-up questions — best-effort, never blocks."""
     try:
         from langchain_mistralai import ChatMistralAI
-        llm = ChatMistralAI(model=model, api_key=api_key, temperature=0.4, max_tokens=120)
+        llm   = ChatMistralAI(model=model, api_key=api_key, temperature=0.4, max_tokens=120)
         prompt = (
             f"Given this Q&A about safety standards:\n"
             f"Q: {question}\nA: {answer[:400]}\n\n"
@@ -237,84 +450,20 @@ def generate_follow_ups(answer: str, question: str, api_key: str, model: str) ->
         return []
 
 
-@st.cache_resource(show_spinner=False)
-def build_vectorstore_from_bytes(_file_tuples: tuple, cache_version: int):
-    """
-    cache_version (no leading underscore) is included in Streamlit's cache key.
-    Incrementing it forces a fresh build even when identical file bytes are re-uploaded.
-    """
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-    from langchain_community.vectorstores import Chroma
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain_community.document_loaders import PyPDFLoader
-    from langchain_core.documents import Document
-    import tempfile, docx2txt
-
-    all_docs = []
-    for filename, file_bytes in _file_tuples:
-        ext = Path(filename).suffix.lower()
-        try:
-            if ext == ".pdf":
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                    tmp.write(file_bytes)
-                loader = PyPDFLoader(tmp.name)
-                docs   = loader.load()
-                for doc in docs:
-                    doc.metadata["source_file"] = filename
-            elif ext in (".docx", ".doc"):
-                text = docx2txt.process(io.BytesIO(file_bytes))
-                docs = [Document(page_content=text, metadata={"source_file": filename})]
-            elif ext == ".txt":
-                text = file_bytes.decode("utf-8", errors="ignore")
-                docs = [Document(page_content=text, metadata={"source_file": filename})]
-            else:
-                continue
-            all_docs.extend(docs)
-        except Exception as e:
-            logger.warning(f"Skipped {filename}: {e}")
-
-    if not all_docs:
-        return None, 0
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, chunk_overlap=200,
-        separators=["\n\n", "\n", ". ", "! ", "? "],
-    )
-    chunks = splitter.split_documents(all_docs)
-
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBED_MODEL,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-    vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings)
-    return vectorstore, len(chunks)
-
-
 def run_rag(
     vectorstore, question: str, model_name: str, api_key: str,
     temperature: float, top_k: int, answer_mode: str,
     indexed_files: list, messages: list, scope_file: str = None,
 ) -> dict:
-    """
-    Full RAG pipeline:
-      1. Cross-doc retrieval (per-file coverage guaranteed)
-      2. Conversation memory injection
-      3. Answer-mode-aware prompt
-      4. Mistral LLM via LangChain
-    """
     from langchain_core.prompts import PromptTemplate
     from langchain_core.output_parsers import StrOutputParser
     from langchain_mistralai import ChatMistralAI
 
     llm = ChatMistralAI(
-        model=model_name,
-        api_key=api_key,
-        temperature=temperature,
-        max_tokens=1536,
+        model=model_name, api_key=api_key,
+        temperature=temperature, max_tokens=1536,
     )
 
-    # Retrieve
     if scope_file and scope_file != "All Documents":
         source_docs = vectorstore.similarity_search(
             question, k=top_k, filter={"source_file": scope_file}
@@ -330,8 +479,10 @@ def run_rag(
 You are a safety standards expert assistant.
 Use ONLY the context below (from official safety standard documents) to answer.
 Each chunk is labeled [Source: filename]. Reference the source filename for every fact you state.
-If the question is relevant to multiple documents, synthesize information from ALL of them.
-If the answer is not found in any document, say so clearly — never invent information.
+The context may include tables in markdown grid format — read them carefully as structured data.
+It may also include OCR-extracted text from scanned pages — treat it as authoritative.
+If the question spans multiple documents, synthesize information from ALL of them.
+If the answer is not in any document, say so clearly — never invent information.
 
 {memory}
 
@@ -350,28 +501,62 @@ Answer:\
     ) | llm | StrOutputParser()
 
     answer = chain.invoke({
-        "context":  context,
-        "question": question,
-        "memory":   memory_text,
-        "mode":     mode_instr,
+        "context": context, "question": question,
+        "memory": memory_text, "mode": mode_instr,
     })
     return {"result": answer, "source_documents": source_docs}
 
 
-# ── Session state ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PARSE STATS BADGE RENDERER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_parse_stats(parse_stats: dict) -> str:
+    """Render a compact per-file parse summary as HTML badges."""
+    if not parse_stats:
+        return ""
+    lines = []
+    for fname, stats in parse_stats.items():
+        badges = []
+        if "error" in stats:
+            badges.append(f'<span class="parse-badge" style="color:var(--danger)">⚠ error</span>')
+        else:
+            if stats.get("pages"):
+                badges.append(f'<span class="parse-badge">{stats["pages"]} pages</span>')
+            if stats.get("tables"):
+                badges.append(f'<span class="parse-badge">📊 {stats["tables"]} tables</span>')
+            if stats.get("ocr_pages"):
+                badges.append(f'<span class="parse-badge">🔍 {stats["ocr_pages"]} OCR pages</span>')
+            if stats.get("paragraphs"):
+                badges.append(f'<span class="parse-badge">{stats["paragraphs"]} paragraphs</span>')
+            if stats.get("note"):
+                badges.append(f'<span class="parse-badge">ℹ {stats["note"]}</span>')
+        short = fname if len(fname) < 28 else fname[:25] + "…"
+        lines.append(f'<div style="margin-bottom:4px"><span style="font-size:11px;color:var(--muted)">{short}</span> {"".join(badges)}</div>')
+    return "".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SESSION STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
 for key, default in [
     ("messages",      []),
     ("vectorstore",   None),
     ("chunk_count",   0),
     ("indexed_files", []),
     ("index_version", 0),
+    ("parse_stats",   {}),
     ("pending_input", ""),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
 
-# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ═══════════════════════════════════════════════════════════════════════════════
+
 with st.sidebar:
     st.markdown("""
     <div style="padding:18px 0 10px">
@@ -400,8 +585,7 @@ with st.sidebar:
           🔑 Get a free key at<br>
           <a href="https://console.mistral.ai" target="_blank" style="color:#f0a500;font-weight:600">
             console.mistral.ai
-          </a><br>
-          Sign up → API Keys → Create new key.
+          </a>
         </div>""", unsafe_allow_html=True)
 
     st.divider()
@@ -411,10 +595,8 @@ with st.sidebar:
     model_label = st.selectbox("Model", list(MISTRAL_MODELS.keys()), index=0,
                                label_visibility="collapsed")
     model_name  = MISTRAL_MODELS[model_label]
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.05,
-                            help="Lower = more factual")
-    top_k       = st.slider("Top-K Sources", 2, 12, 6,
-                            help="Chunks retrieved per question")
+    temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.05, help="Lower = more factual")
+    top_k       = st.slider("Top-K Sources", 2, 12, 6, help="Chunks retrieved per question")
 
     st.divider()
 
@@ -429,8 +611,8 @@ with st.sidebar:
     st.markdown('<span class="sidebar-label">Upload Documents</span>', unsafe_allow_html=True)
     st.markdown("""
     <div class="upload-hint">
-      📁 Upload safety PDFs, Word docs, or text files.<br>
-      All documents are searched together by default.
+      📁 PDF · DOCX · TXT supported<br>
+      Tables, scanned pages &amp; OCR all handled automatically.
     </div>""", unsafe_allow_html=True)
 
     uploaded_files = st.file_uploader(
@@ -441,29 +623,40 @@ with st.sidebar:
 
     if uploaded_files:
         if st.button("⚙️ Build Index from Uploads", use_container_width=True):
-            with st.spinner(f"Processing {len(uploaded_files)} file(s)..."):
+            with st.spinner(f"Processing {len(uploaded_files)} file(s) — OCR may take a moment..."):
                 st.session_state.index_version += 1
                 file_tuples = tuple((f.name, f.read()) for f in uploaded_files)
-                vs, count   = build_vectorstore_from_bytes(
+                vs, count, pstats = build_vectorstore_from_bytes(
                     file_tuples, st.session_state.index_version
                 )
                 if vs:
                     st.session_state.vectorstore   = vs
                     st.session_state.chunk_count   = count
                     st.session_state.indexed_files = [f.name for f in uploaded_files]
+                    st.session_state.parse_stats   = pstats
                     st.success(f"✅ {count:,} chunks indexed across {len(uploaded_files)} file(s)!")
                 else:
-                    st.error("Could not process files. Ensure they are valid PDF / DOCX / TXT.")
+                    st.error("Could not process any files. Check they are valid PDF / DOCX / TXT.")
 
     st.divider()
 
-    # ── Doc scope selector (only shown when >1 doc) ──
+    # ── Parse stats ──
+    if st.session_state.parse_stats:
+        st.markdown('<span class="sidebar-label">Parse Report</span>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="parse-info">{render_parse_stats(st.session_state.parse_stats)}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("")
+
+    # ── Doc scope selector ──
     scope_file = "All Documents"
     if st.session_state.vectorstore and len(st.session_state.indexed_files) > 1:
         st.markdown('<span class="sidebar-label">Search Scope</span>', unsafe_allow_html=True)
-        scope_options = ["All Documents"] + st.session_state.indexed_files
-        scope_file    = st.selectbox("Scope", scope_options, index=0,
-                                     label_visibility="collapsed")
+        scope_file = st.selectbox(
+            "Scope", ["All Documents"] + st.session_state.indexed_files,
+            index=0, label_visibility="collapsed",
+        )
 
     # ── Index stats ──
     if st.session_state.vectorstore:
@@ -483,15 +676,14 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Actions row ──
+    # ── Actions ──
     col_a, col_b = st.columns(2)
     with col_a:
         if st.button("🗑️ Clear All", use_container_width=True):
-            st.session_state.messages      = []
-            st.session_state.vectorstore   = None
-            st.session_state.indexed_files = []
-            st.session_state.chunk_count   = 0
-            st.session_state.pending_input = ""
+            for k in ["messages", "indexed_files", "parse_stats", "pending_input"]:
+                st.session_state[k] = [] if k != "pending_input" and k != "parse_stats" else ({} if k == "parse_stats" else "")
+            st.session_state.vectorstore = None
+            st.session_state.chunk_count = 0
             st.rerun()
     with col_b:
         if st.session_state.messages:
@@ -504,7 +696,10 @@ with st.sidebar:
             )
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
 is_ready    = bool(st.session_state.vectorstore) and bool(mistral_key)
 scope_label = scope_file if scope_file != "All Documents" else "All Documents"
 status_html = (
@@ -518,27 +713,28 @@ st.markdown(f"""
   <div class="rag-logo">🛡️</div>
   <div>
     <div class="rag-title">Safety Standards Assistant</div>
-    <div class="rag-subtitle">Mistral AI · RAG · ChromaDB · Multi-Doc Synthesis</div>
+    <div class="rag-subtitle">Mistral AI · RAG · ChromaDB · Tables · OCR · Multi-Doc</div>
   </div>
   <div style="margin-left:auto">{status_html}</div>
 </div>""", unsafe_allow_html=True)
 
-# ── Welcome screen ────────────────────────────────────────────────────────────
+# ── Welcome ───────────────────────────────────────────────────────────────────
 if not st.session_state.messages:
     st.markdown("""
     <div class="welcome-card">
       <div class="welcome-icon">📋</div>
       <div class="welcome-title">Ask me about your safety documents</div>
       <div class="welcome-text">
-        Upload your safety standard PDFs or Word documents in the sidebar,<br>
-        click <strong style="color:#f0a500">Build Index</strong>, then start asking.<br><br>
-        Answers are synthesized across <em>all</em> uploaded documents automatically.
+        Upload PDFs, Word docs, or text files — including scanned documents.<br><br>
+        <strong style="color:#f0a500">Tables</strong> are read as structured grids &nbsp;·&nbsp;
+        <strong style="color:#f0a500">Scanned pages</strong> are OCR'd automatically &nbsp;·&nbsp;
+        <strong style="color:#f0a500">All docs</strong> are synthesized together.
       </div>
       <div style="margin-top:16px">
         <span class="example-chip">PPE requirements for chemical handling</span>
-        <span class="example-chip">Emergency evacuation procedure</span>
-        <span class="example-chip">ISO 45001 clause 8.1 summary</span>
-        <span class="example-chip">Compare fire safety across documents</span>
+        <span class="example-chip">What does the inspection table show?</span>
+        <span class="example-chip">Emergency evacuation steps</span>
+        <span class="example-chip">Compare requirements across documents</span>
       </div>
     </div>""", unsafe_allow_html=True)
 
@@ -546,14 +742,12 @@ if not st.session_state.messages:
 else:
     st.markdown('<div class="chat-wrapper">', unsafe_allow_html=True)
     for i, msg in enumerate(st.session_state.messages):
-
         if msg["role"] == "user":
             st.markdown(f"""
             <div class="msg-user">
               <div class="msg-avatar avatar-user">👤</div>
               <div class="msg-bubble bubble-user">{msg["content"]}</div>
             </div>""", unsafe_allow_html=True)
-
         else:
             time_html = f'<span class="meta-time">⏱ {msg["time"]}</span>' if msg.get("time") else ""
             conf_html = confidence_badge(msg["confidence"]) if msg.get("confidence") else ""
@@ -571,21 +765,22 @@ else:
               </div>
             </div>""", unsafe_allow_html=True)
 
-            # Raw chunk preview
+            # Raw chunk viewer
             if msg.get("chunks"):
                 with st.expander(f"🔍 View {len(msg['chunks'])} retrieved chunks"):
                     for j, chunk in enumerate(msg["chunks"]):
-                        pg = f" · p{chunk['page']+1}" if chunk.get("page", "") != "" else ""
+                        pg  = f" · p{chunk['page']+1}" if chunk.get("page", "") != "" else ""
+                        ocr = " 🔍OCR" if chunk.get("ocr") else ""
                         st.markdown(
-                            f'<div class="chunk-label">Chunk {j+1} — {chunk["source"]}{pg}</div>',
+                            f'<div class="chunk-label">Chunk {j+1} — {chunk["source"]}{pg}{ocr}</div>',
                             unsafe_allow_html=True,
                         )
                         st.markdown(
-                            f'<div class="chunk-box">{chunk["text"][:600]}</div>',
+                            f'<div class="chunk-box">{chunk["text"][:700]}</div>',
                             unsafe_allow_html=True,
                         )
 
-            # Follow-up suggestion chips
+            # Follow-up chips
             if msg.get("followups"):
                 st.markdown("**💡 Suggested follow-ups:**")
                 cols = st.columns(len(msg["followups"]))
@@ -597,10 +792,9 @@ else:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ── Input area ────────────────────────────────────────────────────────────────
+# ── Input ─────────────────────────────────────────────────────────────────────
 st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
-# Consume any follow-up chip click
 prefill = st.session_state.pending_input
 if prefill:
     st.session_state.pending_input = ""
@@ -609,15 +803,13 @@ col_input, col_send = st.columns([6, 1])
 with col_input:
     user_input = st.text_input(
         "q", label_visibility="collapsed",
-        placeholder="e.g. What are the PPE requirements for working at height?",
-        value=prefill,
-        key="user_input",
-        disabled=not is_ready,
+        placeholder="e.g. What does the PPE inspection table require for height work?",
+        value=prefill, key="user_input", disabled=not is_ready,
     )
 with col_send:
     send = st.button("Send →", use_container_width=True, disabled=not is_ready)
 
-# ── Handle submission ─────────────────────────────────────────────────────────
+# ── Submit ────────────────────────────────────────────────────────────────────
 if send and user_input.strip() and is_ready:
     question = user_input.strip()
     st.session_state.messages.append({"role": "user", "content": question})
@@ -640,12 +832,12 @@ if send and user_input.strip() and is_ready:
 
     answer      = result["result"].strip()
     source_docs = result.get("source_documents", [])
-    confidence  = estimate_confidence(answer, source_docs)
 
     chunk_data = [
         {
             "source": d.metadata.get("source_file", "Unknown"),
             "page":   d.metadata.get("page", ""),
+            "ocr":    d.metadata.get("ocr", False),
             "text":   d.page_content,
         }
         for d in source_docs
@@ -658,7 +850,7 @@ if send and user_input.strip() and is_ready:
         "content":    answer,
         "sources":    format_sources(source_docs),
         "time":       f"{elapsed:.1f}s",
-        "confidence": confidence,
+        "confidence": estimate_confidence(answer, source_docs),
         "chunks":     chunk_data,
         "followups":  followups,
     })
